@@ -7,44 +7,160 @@ from scipy import linalg
 
 paths = []
 
+# Easel's SVG import undersizes paths by a consistent (but mysterious) amount
+magic_scale_factor = 200.0 / 187.50
+
+class MoveTo:
+    def __init__(self, points):
+        self.points = np.array(points)
+
+    @staticmethod
+    def from_tokens(tokens):
+        points = []
+        for tok in tokens:
+            points.append([float(s) for s in tok.split(',')])
+        return MoveTo(points)
+
+    def scale(self, scale_factor):
+        for point_i in range(len(self.points)):
+            self.points *= scale_factor
+
+    def __repr__(self):
+        return ' '.join(['M'] + ['{},{}'.format(x, y) for (x, y) in self.points])
+
+class Arc:
+    def __init__(self, rx, ry, x_axis_rotation, large_arc_flag, sweep_flag, x, y):
+        self.rx = rx
+        self.ry = ry
+        self.x_axis_rotation = x_axis_rotation
+        self.large_arc_flag = large_arc_flag
+        self.sweep_flag = sweep_flag
+        self.x = x
+        self.y = y
+
+    @staticmethod
+    def from_tokens(tokens):
+        rx, ry = [float(s) for s in tokens[0].split(',')]
+        x, y = [float(s) for s in tokens[4].split(',')]
+        return Arc(
+            rx = rx,
+            ry = ry,
+            x_axis_rotation = float(tokens[1]),
+            large_arc_flag = int(tokens[2]),
+            sweep_flag = int(tokens[3]),
+            x = x,
+            y = y,
+            )
+
+        points = []
+        for tok in tokens:
+            points.append([float(s) for s in tok.split(',')])
+        return MoveTo(points)
+
+    def scale(self, scale_factor):
+        self.rx *= scale_factor
+        self.ry *= scale_factor
+        self.x *= scale_factor
+        self.y *= scale_factor
+
+    def __repr__(self):
+        return '{},{} {} {} {} {},{}'.format(
+            self.rx,
+            self.ry,
+            self.x_axis_rotation,
+            self.large_arc_flag,
+            self.sweep_flag,
+            self.x,
+            self.y)
+
+class Arcs:
+    def __init__(self, arcs_list):
+        self.arcs_list = arcs_list
+
+    @staticmethod
+    def from_tokens(tokens):
+        assert(len(tokens) % 5 == 0)
+        arcs_list = []
+        for start_i in range(0, len(tokens), 5):
+            args = tokens[start_i:start_i+5]
+            arcs_list.append(Arc.from_tokens(args))
+        return Arcs(arcs_list)
+
+    def scale(self, scale_factor):
+        for arc in self.arcs_list:
+            arc.scale(scale_factor)
+
+    def __repr__(self):
+        return ' '.join(['A'] + [str(arc) for arc in self.arcs_list])
+
+class ClosePath:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def from_tokens(tokens):
+        return ClosePath()
+
+    def scale(self, scale_factor):
+        pass
+
+    def __repr__(self):
+        return 'z'
+
+def parse_path_data(path_data_str):
+    tokens = path_data_str.split()
+
+    type_indices = []
+    for tok_i, tok in enumerate(tokens):
+         if re.match('[a-zA-Z]', tok):
+             type_indices.append(tok_i)
+    type_indices.append(len(tokens)) # Just to make the next loop simpler
+
+    elements = []
+    for ii_ii, ii in enumerate(type_indices[:-1]):
+        element_type = tokens[ii]
+        ii_next = type_indices[ii_ii+1]
+        args = tokens[ii+1:ii_next]
+
+        if element_type == 'M':
+            elements.append(MoveTo.from_tokens(args))
+        elif element_type == 'A':
+            elements.append(Arcs.from_tokens(args))
+        elif element_type == 'z':
+            elements.append(ClosePath.from_tokens(args))
+        else:
+            raise RuntimeError('Unrecognized element type: {}'.format(
+                element_type))
+    return elements
+
 def parse_paths_in_group(group_node):
     global paths
 
     for child in group_node:
         # inkscape outputs {http://www.w3.org/2000/svg}path for a "path" tag
         if child.tag[-4:] == 'path' or True:
-            data_str = child.get('d')
-            if 'm' in data_str:
-                raise RuntimeError(
-                    'You must set coordinates to "absolute" in Inkscape')
-            print data_str
+            paths.append(parse_path_data(child.get('d')))
 
-            if 'A' in data_str:
-                # Verify that path is already closed; if not we can't fix arcs
-                assert data_str[-1] == 'z'
-                # Pass through
-                print('    <path d="{}" />'.format(data_str))
+def find_paths_to_merge(paths):
+    for path_a_i, path_a in enumerate(paths):
+        for path_b_i, path_b in enumerate(paths):
+            if path_a_i == path_b_i:
+                continue
 
-            assert(data_str[:2] == 'M ')
-            number_strings = float_re.findall(data_str)
-            numbers = [float(s) for s in number_strings]
-            assert(len(numbers) % 2 == 0)
-
-            path = []
-            for ii in range(0, len(numbers), 2):
-                path.append(np.array(numbers[ii:ii+2]))
-            print path
-            paths.append(path)
-
-def merge_paths():
-    # Incredibly inefficient way to do this...
-    for path_a in paths:
-        for path_b in paths:
             d = linalg.norm(path_a[-1] - path_b[0])
-            print d
             if d == 0.0:
-                print('got one!')
+                return path_a_i, path_b_i
+    return None, None
 
+def merge_paths(paths):
+    # Incredibly inefficient way to do this...
+    while True:
+        path_a_i, path_b_i = find_paths_to_merge(paths)
+        if path_a_i is None:
+            return paths
+
+        paths[path_a_i] += paths[path_b_i]
+        del paths[path_b_i]
 
 def parse_recursive(node):
     # Inkscape puts all the actual drawing paths inside of a "g" tag. We only
@@ -58,19 +174,17 @@ def parse_recursive(node):
         parse_recursive(child)
 
 
-data_re = re.compile('"M (.+?)"')
-float_re = re.compile('([\-\.0-9]+)')
-
 filename = sys.argv[1]
 tree = ET.parse(filename)
 root = tree.getroot()
-parse_recursive(root)
-merge_paths()
 
 # Simple line:      d="M -301.181102,999.212598 -354.330709,1052.362205"
 # Arc: M -280.784550,1054.113395 A 21.685039,21.685039 -0.000000 1 0 -324.154629,1054.113395 21.685039,21.685039 -0.000000 1 0 -280.784550,1054.113395 z
 #
 print( '<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
 print('<svg>')
-#print('    <path d="M 0,0 0,200 200,200 200,0 Z" />')
+parse_recursive(root)
+#paths = merge_paths(paths)
+for path in paths:
+    print(' '.join([str(element) for element in path]))
 print('</svg>')
