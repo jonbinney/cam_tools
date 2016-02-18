@@ -1,0 +1,76 @@
+#!/usr/bin/env python
+import sys
+import re
+import xml.etree.ElementTree as ET
+import numpy as np
+from scipy import linalg
+
+paths = []
+
+def parse_paths_in_group(group_node):
+    global paths
+
+    for child in group_node:
+        # inkscape outputs {http://www.w3.org/2000/svg}path for a "path" tag
+        if child.tag[-4:] == 'path' or True:
+            data_str = child.get('d')
+            if 'm' in data_str:
+                raise RuntimeError(
+                    'You must set coordinates to "absolute" in Inkscape')
+            print data_str
+
+            if 'A' in data_str:
+                # Verify that path is already closed; if not we can't fix arcs
+                assert data_str[-1] == 'z'
+                # Pass through
+                print('    <path d="{}" />'.format(data_str))
+
+            assert(data_str[:2] == 'M ')
+            number_strings = float_re.findall(data_str)
+            numbers = [float(s) for s in number_strings]
+            assert(len(numbers) % 2 == 0)
+
+            path = []
+            for ii in range(0, len(numbers), 2):
+                path.append(np.array(numbers[ii:ii+2]))
+            print path
+            paths.append(path)
+
+def merge_paths():
+    # Incredibly inefficient way to do this...
+    for path_a in paths:
+        for path_b in paths:
+            d = linalg.norm(path_a[-1] - path_b[0])
+            print d
+            if d == 0.0:
+                print('got one!')
+
+
+def parse_recursive(node):
+    # Inkscape puts all the actual drawing paths inside of a "g" tag. We only
+    # want these; we ignore the page border paths, for example.
+    # Inkscape uses "{http://www.w3.org/2000/svg}g" for a group
+    if node.tag[-2:] == '}g':
+        parse_paths_in_group(node)
+        return
+
+    for child in node:
+        parse_recursive(child)
+
+
+data_re = re.compile('"M (.+?)"')
+float_re = re.compile('([\-\.0-9]+)')
+
+filename = sys.argv[1]
+tree = ET.parse(filename)
+root = tree.getroot()
+parse_recursive(root)
+merge_paths()
+
+# Simple line:      d="M -301.181102,999.212598 -354.330709,1052.362205"
+# Arc: M -280.784550,1054.113395 A 21.685039,21.685039 -0.000000 1 0 -324.154629,1054.113395 21.685039,21.685039 -0.000000 1 0 -280.784550,1054.113395 z
+#
+print( '<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
+print('<svg>')
+#print('    <path d="M 0,0 0,200 200,200 200,0 Z" />')
+print('</svg>')
