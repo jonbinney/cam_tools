@@ -5,13 +5,9 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from scipy import linalg
 
-paths = []
-
-# Easel's SVG import undersizes paths by a consistent (but mysterious) amount
-magic_scale_factor = 200.0 / 187.50
-
 class MoveTo:
     def __init__(self, points):
+        assert(len(points) > 0)
         self.points = np.array(points)
 
     @staticmethod
@@ -21,15 +17,25 @@ class MoveTo:
             points.append([float(s) for s in tok.split(',')])
         return MoveTo(points)
 
+    def get_start(self):
+        return self.points[0]
+
+    def get_end(self):
+        return self.points[-1]
+
     def scale(self, scale_factor):
-        for point_i in range(len(self.points)):
-            self.points *= scale_factor
+        self.points *= scale_factor
+
+    def extend(self, other_move_to):
+        self.points = np.concatenate([self.points, other_move_to.points])
 
     def __repr__(self):
-        return ' '.join(['M'] + ['{},{}'.format(x, y) for (x, y) in self.points])
+        return ' '.join(['M'] + ['{},{}'.format(*p) for p in self.points])
 
 class Arc:
-    def __init__(self, rx, ry, x_axis_rotation, large_arc_flag, sweep_flag, x, y):
+    def __init__(
+        self, rx, ry, x_axis_rotation, large_arc_flag, sweep_flag, x, y):
+
         self.rx = rx
         self.ry = ry
         self.x_axis_rotation = x_axis_rotation
@@ -57,6 +63,13 @@ class Arc:
             points.append([float(s) for s in tok.split(',')])
         return MoveTo(points)
 
+    def get_start(self):
+        raise RuntimeError(
+            'Arc start is implicitly defined by command before it')
+
+    def get_end(self):
+        return np.array((self.x, self.y))
+
     def scale(self, scale_factor):
         self.rx *= scale_factor
         self.ry *= scale_factor
@@ -75,6 +88,7 @@ class Arc:
 
 class Arcs:
     def __init__(self, arcs_list):
+        assert(len(arcs_list) > 0)
         self.arcs_list = arcs_list
 
     @staticmethod
@@ -85,6 +99,13 @@ class Arcs:
             args = tokens[start_i:start_i+5]
             arcs_list.append(Arc.from_tokens(args))
         return Arcs(arcs_list)
+
+    def get_start(self):
+        raise RuntimeError(
+            'Arcs start is implicitly defined by command before it')
+
+    def get_end(self):
+        return self.arcs_list[-1].get_end()
 
     def scale(self, scale_factor):
         for arc in self.arcs_list:
@@ -101,13 +122,61 @@ class ClosePath:
     def from_tokens(tokens):
         return ClosePath()
 
+    def get_start(self):
+        raise RuntimeError(
+            'Closepath start is implicitly defined by command before it')
+
+    def get_end(self):
+        raise RuntimeError(
+            'Closepath end is implicitly defined by command before it')
+
     def scale(self, scale_factor):
         pass
 
     def __repr__(self):
         return 'z'
 
+class Path:
+    def __init__(self, commands):
+        assert(len(commands) > 0)
+        self.commands = commands
+
+    def get_start(self):
+        return self.commands[0].get_start()
+
+    def get_end(self):
+        if isinstance(self.commands[-1], ClosePath):
+            return self.commands[-2].get_end()
+        else:
+            return self.commands[-1].get_end()
+
+    def scale(self, scale_factor):
+        for command in self.commands:
+            command.scale(scale_factor)
+
+    def extend(self, other_path):
+        if isinstance(self.commands[-1], ClosePath):
+            del self.commands[-1]
+
+        for command in other_path.commands:
+            prv_command = self.commands[-1]
+
+            # To get a connected path, commands need to be connected
+            if isinstance(prv_command, MoveTo) and isinstance(command, MoveTo):
+                prv_command.extend(command)
+            else:
+                self.commands += other_path.commands
+
+    def ensure_closed(self):
+        if not isinstance(self.commands[-1], ClosePath):
+            self.commands.append(ClosePath())
+
+    def __repr__(self):
+        return '    <path d="{}"/>'.format(
+            ' '.join([str(command) for command in self.commands]))
+
 def parse_path_data(path_data_str):
+
     tokens = path_data_str.split()
 
     type_indices = []
@@ -116,50 +185,51 @@ def parse_path_data(path_data_str):
              type_indices.append(tok_i)
     type_indices.append(len(tokens)) # Just to make the next loop simpler
 
-    elements = []
+    commands = []
     for ii_ii, ii in enumerate(type_indices[:-1]):
-        element_type = tokens[ii]
+        command_type = tokens[ii]
         ii_next = type_indices[ii_ii+1]
         args = tokens[ii+1:ii_next]
 
-        if element_type == 'M':
-            elements.append(MoveTo.from_tokens(args))
-        elif element_type == 'A':
-            elements.append(Arcs.from_tokens(args))
-        elif element_type == 'z':
-            elements.append(ClosePath.from_tokens(args))
+        if command_type == 'M':
+            commands.append(MoveTo.from_tokens(args))
+        elif command_type == 'A':
+            commands.append(Arcs.from_tokens(args))
+        elif command_type == 'z':
+            commands.append(ClosePath.from_tokens(args))
         else:
-            raise RuntimeError('Unrecognized element type: {}'.format(
-                element_type))
-    return elements
+            raise RuntimeError('Unrecognized command type: {}'.format(
+                command_type))
+    return Path(commands)
 
 def parse_paths_in_group(group_node):
     global paths
 
     for child in group_node:
         # inkscape outputs {http://www.w3.org/2000/svg}path for a "path" tag
-        if child.tag[-4:] == 'path' or True:
+        if child.tag[-4:] == 'path':
             paths.append(parse_path_data(child.get('d')))
 
 def find_paths_to_merge(paths):
     for path_a_i, path_a in enumerate(paths):
         for path_b_i, path_b in enumerate(paths):
-            if path_a_i == path_b_i:
+            if path_a_i is path_b_i:
                 continue
 
-            d = linalg.norm(path_a[-1] - path_b[0])
+            d = linalg.norm(path_a.get_end() - path_b.get_start())
             if d == 0.0:
                 return path_a_i, path_b_i
     return None, None
 
 def merge_paths(paths):
-    # Incredibly inefficient way to do this...
+    # Incredibly inefficient way to do this... I belive this has running time
+    # which is quadratic in the number of paths
     while True:
         path_a_i, path_b_i = find_paths_to_merge(paths)
         if path_a_i is None:
             return paths
 
-        paths[path_a_i] += paths[path_b_i]
+        paths[path_a_i].extend(paths[path_b_i])
         del paths[path_b_i]
 
 def parse_recursive(node):
@@ -173,18 +243,23 @@ def parse_recursive(node):
     for child in node:
         parse_recursive(child)
 
+input_filename = sys.argv[1]
+paths = []
 
-filename = sys.argv[1]
-tree = ET.parse(filename)
+# Easel's SVG import undersizes paths by a consistent (but mysterious) amount.
+# This was calculated by importing a square of known size into easel and
+# checking its dimensions.
+easel_magic_scale_factor = 200.0 / 187.50
+
+tree = ET.parse(input_filename)
 root = tree.getroot()
 
-# Simple line:      d="M -301.181102,999.212598 -354.330709,1052.362205"
-# Arc: M -280.784550,1054.113395 A 21.685039,21.685039 -0.000000 1 0 -324.154629,1054.113395 21.685039,21.685039 -0.000000 1 0 -280.784550,1054.113395 z
-#
 print( '<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
 print('<svg>')
 parse_recursive(root)
-#paths = merge_paths(paths)
+paths = merge_paths(paths)
 for path in paths:
-    print(' '.join([str(element) for element in path]))
+    path.ensure_closed()
+    path.scale(easel_magic_scale_factor)
+    print(str(path))
 print('</svg>')
